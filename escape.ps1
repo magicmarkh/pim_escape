@@ -1,3 +1,4 @@
+# Combined PIM to CyberArk SCA Migration Script
 # This script exports Azure subscription PIM data and creates corresponding CyberArk SCA policies
 
 param(
@@ -33,6 +34,67 @@ function Write-Log {
 # Initialize log file
 "=== PIM to CyberArk SCA Migration Script Started at $logStartTime ===" | Out-File -FilePath $logFile -Encoding UTF8
 Write-Log "Starting PIM to CyberArk SCA migration script" "INFO"
+
+# ========================================
+# INSTALL REQUIRED MODULES
+# ========================================
+
+Write-Log "=== CHECKING AND INSTALLING REQUIRED MODULES ===" "INFO"
+
+# Function to install module if not available
+function Install-RequiredModule {
+    param(
+        [string]$ModuleName,
+        [string]$MinimumVersion = $null
+    )
+    
+    Write-Log "Checking module: $ModuleName" "DEBUG"
+    
+    $installedModule = Get-Module -ListAvailable -Name $ModuleName | Sort-Object Version -Descending | Select-Object -First 1
+    
+    if (!$installedModule) {
+        Write-Log "Module $ModuleName not found. Installing..." "INFO"
+        try {
+            Install-Module -Name $ModuleName -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck
+            Write-Log "Successfully installed module: $ModuleName" "SUCCESS"
+        } catch {
+            Write-Log "Failed to install module $ModuleName`: $($_.Exception.Message)" "ERROR"
+            return $false
+        }
+    } else {
+        Write-Log "Module $ModuleName already installed (Version: $($installedModule.Version))" "DEBUG"
+    }
+    
+    # Import the module
+    try {
+        Import-Module -Name $ModuleName -Force
+        Write-Log "Successfully imported module: $ModuleName" "DEBUG"
+        return $true
+    } catch {
+        Write-Log "Failed to import module $ModuleName`: $($_.Exception.Message)" "WARNING"
+        return $false
+    }
+}
+
+# Install required modules
+$requiredModules = @(
+    "Microsoft.Graph.Authentication",
+    "Microsoft.Graph.Identity.Governance"
+)
+
+$moduleInstallSuccess = $true
+foreach ($module in $requiredModules) {
+    $result = Install-RequiredModule -ModuleName $module
+    if (!$result) {
+        $moduleInstallSuccess = $false
+    }
+}
+
+if ($moduleInstallSuccess) {
+    Write-Log "All required modules installed and imported successfully" "SUCCESS"
+} else {
+    Write-Log "Some modules failed to install. Graph API functionality may be limited." "WARNING"
+}
 
 # Function to read configuration file
 function Read-ConfigFile {
@@ -190,13 +252,102 @@ $azToken = [Microsoft.Azure.Commands.Common.Authentication.AzureSession]::Instan
 
 # Get access token for Microsoft Graph
 Write-Log "Getting Microsoft Graph access token..." "INFO"
+$graphToken = $null
+
+# Try to connect using Microsoft Graph PowerShell (modern approach)
 try {
-    $graphToken = [Microsoft.Azure.Commands.Common.Authentication.AzureSession]::Instance.AuthenticationFactory.Authenticate($azContext.Account, $azContext.Environment, $azContext.Tenant.Id, $null, "Never", $null, "https://graph.microsoft.com/").AccessToken
-    Write-Log "Successfully obtained Graph API token" "DEBUG"
+    Write-Log "Connecting to Microsoft Graph with PIM scopes..." "DEBUG"
+    
+    # Connect with specific scopes needed for PIM
+    $requiredScopes = @(
+        "RoleManagement.Read.Directory",
+        "RoleEligibilitySchedule.Read.Directory", 
+        "Directory.Read.All",
+        "User.Read.All",
+        "Group.Read.All"
+    )
+    
+    # Use the same tenant as Azure context for consistency
+    Connect-MgGraph -Scopes $requiredScopes -TenantId $azContext.Tenant.Id -NoWelcome
+    
+    # Verify connection
+    $mgContext = Get-MgContext
+    if ($mgContext) {
+        Write-Log "Successfully connected to Microsoft Graph" "SUCCESS"
+        Write-Log "Account: $($mgContext.Account)" "DEBUG"
+        Write-Log "Scopes: $($mgContext.Scopes -join ', ')" "DEBUG"
+        
+        # Get the access token using the correct method for the available Graph module version
+        try {
+            # Try the newer method first
+            if (Get-Command "Get-MgAccessToken" -ErrorAction SilentlyContinue) {
+                $graphToken = Get-MgAccessToken
+                Write-Log "Got access token using Get-MgAccessToken" "DEBUG"
+            } else {
+                # Fallback to accessing the token from the context
+                $authProvider = $mgContext | Get-Member -Name "AuthType" -ErrorAction SilentlyContinue
+                if ($authProvider) {
+                    # For newer versions, try to get token from internal session
+                    $graphToken = [Microsoft.Graph.PowerShell.Authentication.GraphSession]::Instance.AuthenticationProvider.GetAccessToken()
+                    Write-Log "Got access token from GraphSession" "DEBUG"
+                } else {
+                    # Alternative method for older versions
+                    Write-Log "Using Connect-MgGraph session - token will be handled internally" "DEBUG"
+                    $graphToken = "INTERNAL_MG_SESSION" # Special marker to indicate we have a valid session
+                }
+            }
+        } catch {
+            Write-Log "Could not extract access token, but connection exists: $($_.Exception.Message)" "DEBUG"
+            # Still mark as having a graph connection even if we can't extract the token
+            $graphToken = "INTERNAL_MG_SESSION"
+        }
+        
+        # Test the connection with a simple API call (if we have an actual token)
+        if ($graphToken -and $graphToken -ne "INTERNAL_MG_SESSION") {
+            $testHeaders = @{
+                'Authorization' = "Bearer $graphToken"
+                'Content-Type' = 'application/json'
+            }
+            
+            try {
+                $testUrl = "https://graph.microsoft.com/v1.0/me"
+                $testResponse = Invoke-RestMethod -Uri $testUrl -Headers $testHeaders -Method Get -ErrorAction SilentlyContinue
+                Write-Log "Graph token test successful - authenticated as: $($testResponse.userPrincipalName)" "SUCCESS"
+            } catch {
+                Write-Log "Graph token test failed: $($_.Exception.Message)" "WARNING"
+                Write-Log "Will try using PowerShell cmdlets instead of REST API" "INFO"
+            }
+        } else {
+            Write-Log "Using Microsoft Graph PowerShell session (no direct token access)" "INFO"
+        }
+    } else {
+        Write-Log "Failed to establish Microsoft Graph context" "ERROR"
+    }
+    
 } catch {
-    Write-Log "Could not obtain Graph API token: $($_.Exception.Message)" "WARNING"
-    Write-Log "UPN resolution will be skipped" "WARNING"
-    $graphToken = $null
+    Write-Log "Microsoft Graph connection failed: $($_.Exception.Message)" "ERROR"
+    Write-Log "Attempting fallback authentication method..." "DEBUG"
+    
+    # Fallback to Azure session authentication
+    try {
+        $graphToken = [Microsoft.Azure.Commands.Common.Authentication.AzureSession]::Instance.AuthenticationFactory.Authenticate($azContext.Account, $azContext.Environment, $azContext.Tenant.Id, $null, "Never", $null, "https://graph.microsoft.com/").AccessToken
+        Write-Log "Fallback Graph token method succeeded" "SUCCESS"
+    } catch {
+        Write-Log "Fallback Graph token method also failed: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+if (!$graphToken) {
+    Write-Log "Could not obtain Graph API token using any method" "WARNING"
+    Write-Log "UPN resolution and Entra PIM assignments will be skipped" "WARNING"
+    Write-Log "" "INFO"
+    Write-Log "To access Entra PIM assignments, ensure you have:" "INFO"
+    Write-Log "1. Global Administrator or Privileged Role Administrator role in Entra ID" "INFO"
+    Write-Log "2. Sufficient permissions to consent to Graph API scopes" "INFO"
+    Write-Log "3. Access to Privileged Identity Management features" "INFO"
+    Write-Log "" "INFO"
+} else {
+    Write-Log "Graph API authentication successful - Entra PIM assignments will be processed" "SUCCESS"
 }
 
 # Set up headers for REST API calls
@@ -213,6 +364,8 @@ Write-Log "Found $($subscriptions.Count) subscriptions" "INFO"
 # Initialize PIM results array
 $pimResults = @()
 
+# Process Azure subscription PIM assignments
+Write-Log "Processing Azure subscription PIM assignments..." "INFO"
 foreach ($subscription in $subscriptions) {
     Write-Log "Processing subscription: $($subscription.Name)" "INFO"
     
@@ -249,18 +402,31 @@ foreach ($subscription in $subscriptions) {
                 # Try to resolve UPN for users via Microsoft Graph API
                 if ($principalType -eq "User" -and $principalId -and $graphToken) {
                     try {
-                        $graphUrl = "https://graph.microsoft.com/v1.0/users/$principalId"
-                        $graphHeaders = @{
-                            'Authorization' = "Bearer $graphToken"
-                            'Content-Type' = 'application/json'
-                        }
-                        $userInfo = Invoke-RestMethod -Uri $graphUrl -Headers $graphHeaders -Method Get -ErrorAction SilentlyContinue
-                        if ($userInfo -and $userInfo.userPrincipalName) {
-                            $principalUPN = $userInfo.userPrincipalName
-                            if ($userInfo.displayName) {
-                                $principalName = $userInfo.displayName
+                        if ($graphToken -ne "INTERNAL_MG_SESSION") {
+                            # Use REST API with actual token
+                            $graphUrl = "https://graph.microsoft.com/v1.0/users/$principalId"
+                            $graphHeaders = @{
+                                'Authorization' = "Bearer $graphToken"
+                                'Content-Type' = 'application/json'
                             }
-                            Write-Log "Resolved UPN for user $principalName`: $principalUPN" "DEBUG"
+                            $userInfo = Invoke-RestMethod -Uri $graphUrl -Headers $graphHeaders -Method Get -ErrorAction SilentlyContinue
+                            if ($userInfo -and $userInfo.userPrincipalName) {
+                                $principalUPN = $userInfo.userPrincipalName
+                                if ($userInfo.displayName) {
+                                    $principalName = $userInfo.displayName
+                                }
+                                Write-Log "Resolved UPN for user $principalName`: $principalUPN" "DEBUG"
+                            }
+                        } else {
+                            # Use PowerShell cmdlets with internal session
+                            $userInfo = Get-MgUser -UserId $principalId -ErrorAction SilentlyContinue
+                            if ($userInfo) {
+                                $principalUPN = $userInfo.UserPrincipalName
+                                if ($userInfo.DisplayName) {
+                                    $principalName = $userInfo.DisplayName
+                                }
+                                Write-Log "Resolved UPN for user via cmdlet $principalName`: $principalUPN" "DEBUG"
+                            }
                         }
                     } catch {
                         Write-Log "Could not resolve UPN for user $principalId`: $($_.Exception.Message)" "DEBUG"
@@ -330,6 +496,7 @@ foreach ($subscription in $subscriptions) {
                 
                 # Create result object
                 $result = [PSCustomObject]@{
+                    AssignmentType = "Azure Subscription Role"
                     AssignmentId = $assignment.name
                     AssignmentName = $assignment.name
                     PrincipalId = $principalId
@@ -364,12 +531,270 @@ foreach ($subscription in $subscriptions) {
                 $pimResults += $result
                 
             } catch {
-                Write-Log "Error processing assignment $($assignment.name): $($_.Exception.Message)" "ERROR"
+                Write-Log "Error processing subscription assignment $($assignment.name): $($_.Exception.Message)" "ERROR"
             }
         }
         
     } catch {
         Write-Log "Could not retrieve PIM assignments for subscription $($subscription.Name): $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# Process Entra (Azure AD) PIM assignments
+Write-Log "Processing Entra (Azure AD) PIM directory role assignments..." "INFO"
+
+if (!$graphToken) {
+    Write-Log "No Graph token available - skipping Entra PIM assignments" "WARNING"
+} else {
+    Write-Log "Note: Entra PIM requires specific Graph API permissions or PowerShell cmdlets" "INFO"
+    
+    # Try using PowerShell cmdlets first (preferred method)
+    $entraAssignments = @()
+    $usingCmdlets = $false
+    
+    # Check if we have a valid MgGraph session (either with token or internal session)
+    $mgContext = Get-MgContext
+    if ($mgContext -and ($graphToken -eq "INTERNAL_MG_SESSION" -or $graphToken)) {
+        try {
+            Write-Log "Attempting to use Microsoft.Graph PowerShell cmdlets..." "DEBUG"
+            
+            # Try to get assignments using PowerShell cmdlets
+            $entraAssignments = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All -ErrorAction Stop
+            
+            if ($entraAssignments.Count -gt 0) {
+                Write-Log "Successfully retrieved $($entraAssignments.Count) Entra PIM assignments using PowerShell cmdlets" "SUCCESS"
+                $usingCmdlets = $true
+            } else {
+                Write-Log "PowerShell cmdlets returned no results" "INFO"
+                $usingCmdlets = $true  # Still mark as using cmdlets even if no results
+            }
+        } catch {
+            Write-Log "PowerShell cmdlets approach failed: $($_.Exception.Message)" "WARNING"
+            
+            # Check if it's a permissions issue
+            if ($_.Exception.Message -like "*Forbidden*" -or $_.Exception.Message -like "*403*") {
+                Write-Log "Access denied - insufficient permissions for Entra PIM" "ERROR"
+                Write-Log "Required roles: Global Administrator, Privileged Role Administrator, or Security Administrator" "INFO"
+            }
+        }
+    }
+    
+    # If cmdlets didn't work and we have an actual token, try REST API
+    if (!$usingCmdlets -and $graphToken -and $graphToken -ne "INTERNAL_MG_SESSION") {
+        Write-Log "Falling back to REST API approach..." "DEBUG"
+        Write-Log "Required Graph API permissions:" "INFO"
+        Write-Log "- RoleEligibilitySchedule.Read.Directory" "INFO"
+        Write-Log "- RoleManagement.Read.Directory" "INFO"
+        Write-Log "- Directory.Read.All" "INFO"
+        
+        try {
+            $entraApiUrl = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules"
+            
+            Write-Log "Calling Entra PIM API: $entraApiUrl" "DEBUG"
+            $graphHeaders = @{
+                'Authorization' = "Bearer $graphToken"
+                'Content-Type' = 'application/json'
+            }
+            
+            $entraResponse = Invoke-RestMethod -Uri $entraApiUrl -Headers $graphHeaders -Method Get
+            $entraAssignments = $entraResponse.value
+            Write-Log "Successfully retrieved $($entraAssignments.Count) Entra PIM assignments using REST API" "SUCCESS"
+            
+        } catch {
+            Write-Log "Could not retrieve Entra PIM assignments via REST API: $($_.Exception.Message)" "ERROR"
+            Write-Log "This is likely due to insufficient Graph API permissions" "ERROR"
+            Write-Log "Required permissions: RoleEligibilitySchedule.Read.Directory, RoleManagement.Read.Directory, Directory.Read.All" "ERROR"
+            
+            if ($_.Exception.Response) {
+                Write-Log "Status Code: $($_.Exception.Response.StatusCode)" "ERROR"
+                Write-Log "Status Description: $($_.Exception.Response.StatusDescription)" "ERROR"
+            }
+            
+            Write-Log "Continuing with subscription PIM assignments only..." "INFO"
+            $entraAssignments = @()
+        }
+    }
+    
+    # Process the Entra assignments if we got any
+    if ($entraAssignments.Count -gt 0) {
+        Write-Log "Processing $($entraAssignments.Count) Entra directory role assignments..." "INFO"
+        
+        foreach ($assignment in $entraAssignments) {
+            try {
+                Write-Log "Processing Entra assignment: $($assignment.id)" "DEBUG"
+                
+                # Get principal information and resolve UPN for Entra assignments
+                $principalId = $assignment.principalId
+                $principalType = "Unknown"
+                $principalName = "Unknown"
+                $principalUPN = "N/A"
+                
+                Write-Log "Resolving principal $principalId" "DEBUG"
+                
+                # Resolve principal details - use cmdlets if available, otherwise REST API
+                if ($principalId) {
+                    try {
+                        if ($usingCmdlets) {
+                            # Try using PowerShell cmdlets
+                            try {
+                                $userInfo = Get-MgUser -UserId $principalId -ErrorAction SilentlyContinue
+                                if ($userInfo) {
+                                    $principalType = "User"
+                                    $principalName = $userInfo.DisplayName
+                                    $principalUPN = $userInfo.UserPrincipalName
+                                    Write-Log "Resolved as user via cmdlet: $principalName ($principalUPN)" "DEBUG"
+                                } else {
+                                    $groupInfo = Get-MgGroup -GroupId $principalId -ErrorAction SilentlyContinue
+                                    if ($groupInfo) {
+                                        $principalType = "Group"
+                                        $principalName = $groupInfo.DisplayName
+                                        Write-Log "Resolved as group via cmdlet: $principalName" "DEBUG"
+                                    } else {
+                                        $spInfo = Get-MgServicePrincipal -ServicePrincipalId $principalId -ErrorAction SilentlyContinue
+                                        if ($spInfo) {
+                                            $principalType = "ServicePrincipal"
+                                            $principalName = $spInfo.DisplayName
+                                            $principalUPN = $spInfo.AppId
+                                            Write-Log "Resolved as service principal via cmdlet: $principalName" "DEBUG"
+                                        }
+                                    }
+                                }
+                            } catch {
+                                Write-Log "Cmdlet resolution failed for $principalId`: $($_.Exception.Message)" "DEBUG"
+                            }
+                        } elseif ($graphToken -and $graphToken -ne "INTERNAL_MG_SESSION") {
+                            # Use REST API approach
+                            $graphHeaders = @{
+                                'Authorization' = "Bearer $graphToken"
+                                'Content-Type' = 'application/json'
+                            }
+                            
+                            # Try as user first
+                            $userUrl = "https://graph.microsoft.com/v1.0/users/$principalId"
+                            $userInfo = Invoke-RestMethod -Uri $userUrl -Headers $graphHeaders -Method Get -ErrorAction SilentlyContinue
+                            if ($userInfo) {
+                                $principalType = "User"
+                                $principalName = $userInfo.displayName
+                                $principalUPN = $userInfo.userPrincipalName
+                                Write-Log "Resolved as user via API: $principalName ($principalUPN)" "DEBUG"
+                            } else {
+                                # Try as group
+                                $groupUrl = "https://graph.microsoft.com/v1.0/groups/$principalId"
+                                $groupInfo = Invoke-RestMethod -Uri $groupUrl -Headers $graphHeaders -Method Get -ErrorAction SilentlyContinue
+                                if ($groupInfo) {
+                                    $principalType = "Group"
+                                    $principalName = $groupInfo.displayName
+                                    Write-Log "Resolved as group via API: $principalName" "DEBUG"
+                                } else {
+                                    # Try as service principal
+                                    $spUrl = "https://graph.microsoft.com/v1.0/servicePrincipals/$principalId"
+                                    $spInfo = Invoke-RestMethod -Uri $spUrl -Headers $graphHeaders -Method Get -ErrorAction SilentlyContinue
+                                    if ($spInfo) {
+                                        $principalType = "ServicePrincipal"
+                                        $principalName = $spInfo.displayName
+                                        $principalUPN = $spInfo.appId
+                                        Write-Log "Resolved as service principal via API: $principalName" "DEBUG"
+                                    }
+                                }
+                            }
+                        }
+                    } catch {
+                        Write-Log "Could not resolve Entra principal $principalId`: $($_.Exception.Message)" "DEBUG"
+                    }
+                }
+                
+                # Get role definition information
+                $roleDefinitionId = $assignment.roleDefinitionId
+                $roleName = "Unknown"
+                Write-Log "Resolving role definition $roleDefinitionId" "DEBUG"
+                
+                if ($roleDefinitionId) {
+                    try {
+                        if ($usingCmdlets) {
+                            # Use cmdlet to get role definition
+                            $roleDefInfo = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $roleDefinitionId -ErrorAction SilentlyContinue
+                            if ($roleDefInfo) {
+                                $roleName = $roleDefInfo.DisplayName
+                                Write-Log "Resolved role via cmdlet: $roleName" "DEBUG"
+                            }
+                        } elseif ($graphToken -and $graphToken -ne "INTERNAL_MG_SESSION") {
+                            # Use REST API to get role definition
+                            $roleDefUrl = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions/$roleDefinitionId"
+                            $graphHeaders = @{
+                                'Authorization' = "Bearer $graphToken"
+                                'Content-Type' = 'application/json'
+                            }
+                            $roleDefInfo = Invoke-RestMethod -Uri $roleDefUrl -Headers $graphHeaders -Method Get -ErrorAction SilentlyContinue
+                            if ($roleDefInfo) {
+                                $roleName = $roleDefInfo.displayName
+                                Write-Log "Resolved role via API: $roleName" "DEBUG"
+                            }
+                        }
+                    } catch {
+                        Write-Log "Could not resolve Entra role definition $roleDefinitionId`: $($_.Exception.Message)" "DEBUG"
+                    }
+                }
+                
+                # Extract timing information
+                $eligibilityStartDate = if ($assignment.startDateTime) { $assignment.startDateTime } else { "Not set" }
+                $eligibilityEndDate = if ($assignment.endDateTime) { $assignment.endDateTime } else { "Permanent" }
+                
+                # Calculate eligibility duration
+                $eligibilityDurationDays = "Permanent"
+                if ($assignment.startDateTime -and $assignment.endDateTime) {
+                    try {
+                        $startDate = [DateTime]::Parse($assignment.startDateTime)
+                        $endDate = [DateTime]::Parse($assignment.endDateTime)
+                        $duration = $endDate - $startDate
+                        $eligibilityDurationDays = $duration.Days
+                    } catch {
+                        $eligibilityDurationDays = "Unable to calculate"
+                    }
+                }
+                
+                # Create result object for Entra assignment
+                $result = [PSCustomObject]@{
+                    AssignmentType = "Entra Directory Role"
+                    AssignmentId = $assignment.id
+                    AssignmentName = $assignment.id
+                    PrincipalId = $principalId
+                    PrincipalType = $principalType
+                    PrincipalName = $principalName
+                    PrincipalUPN = $principalUPN
+                    RoleDefinitionId = $roleDefinitionId
+                    RoleName = $roleName
+                    ScopeId = $assignment.directoryScopeId
+                    ScopeName = if ($assignment.directoryScopeId -eq "/") { "Directory" } else { $assignment.directoryScopeId }
+                    ScopeType = "Directory"
+                    SubscriptionId = "N/A"
+                    SubscriptionName = "N/A"
+                    ResourceGroupName = "N/A"
+                    ResourceName = "N/A"
+                    ResourceType = "N/A"
+                    Status = $assignment.status
+                    EligibilityStartDate = $eligibilityStartDate
+                    EligibilityEndDate = $eligibilityEndDate
+                    EligibilityDurationDays = $eligibilityDurationDays
+                    MaxActivationDuration = "Requires policy lookup"
+                    MaxActivationDurationHours = "Requires policy lookup"
+                    StartDateTime = $assignment.startDateTime
+                    EndDateTime = $assignment.endDateTime
+                    CreatedDateTime = $assignment.createdDateTime
+                    UpdatedDateTime = $assignment.modifiedDateTime
+                    MemberType = $assignment.memberType
+                    Condition = $null
+                    ConditionVersion = $null
+                }
+                
+                $pimResults += $result
+                Write-Log "Added Entra assignment: $principalName -> $roleName" "DEBUG"
+                
+            } catch {
+                Write-Log "Error processing Entra assignment $($assignment.id): $($_.Exception.Message)" "ERROR"
+            }
+        }
+    } else {
+        Write-Log "No Entra PIM assignments found or accessible" "WARNING"
     }
 }
 
@@ -382,19 +807,19 @@ if ($pimResults.Count -eq 0) {
 }
 
 # Display summary statistics
-Write-Host "`nPrincipal Types:" -ForegroundColor Cyan
+Write-Log "`nAssignment Types:" "INFO"
+$pimResults | Group-Object AssignmentType | Sort-Object Count -Descending | ForEach-Object {
+    Write-Log "$($_.Name): $($_.Count)" "INFO"
+}
+
+Write-Log "`nPrincipal Types:" "INFO"
 $pimResults | Group-Object PrincipalType | Sort-Object Count -Descending | ForEach-Object {
-    Write-Host "$($_.Name): $($_.Count)" -ForegroundColor White
+    Write-Log "$($_.Name): $($_.Count)" "INFO"
 }
 
-Write-Host "`nScope Types:" -ForegroundColor Cyan
+Write-Log "`nScope Types:" "INFO"
 $pimResults | Group-Object ScopeType | Sort-Object Count -Descending | ForEach-Object {
-    Write-Host "$($_.Name): $($_.Count)" -ForegroundColor White
-}
-
-Write-Host "`nTop 5 Most Common Roles:" -ForegroundColor Cyan
-$pimResults | Group-Object RoleName | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object {
-    Write-Host "$($_.Name): $($_.Count)" -ForegroundColor White
+    Write-Log "$($_.Name): $($_.Count)" "INFO"
 }
 
 # ========================================
@@ -501,10 +926,19 @@ $processedCount = 0
 foreach ($assignment in $pimResults) {
     try {
         $processedCount++
-        Write-Log "[$processedCount/$($pimResults.Count)] Processing: $($assignment.PrincipalName) -> $($assignment.RoleName) on $($assignment.SubscriptionName)" "INFO"
+        
+        # Skip ServicePrincipal assignments
+        if ($assignment.PrincipalType -eq "ServicePrincipal") {
+            Write-Log "[$processedCount/$($pimResults.Count)] Skipping ServicePrincipal: $($assignment.PrincipalName) -> $($assignment.RoleName)" "INFO"
+            continue
+        }
+        
+        Write-Log "[$processedCount/$($pimResults.Count)] Processing: $($assignment.PrincipalName) -> $($assignment.RoleName) on $($assignment.ScopeName)" "INFO"
         
         # Build policy name with optional prefix/suffix
-        $policyName = "$($assignment.SubscriptionName)-$($assignment.PrincipalName)-$($assignment.RoleName)"
+        # Use "Entra-" prefix for directory roles, SubscriptionName for subscription roles
+        $policyNamePrefix = if ($assignment.AssignmentType -eq "Entra Directory Role") { "Entra" } else { $assignment.SubscriptionName }
+        $policyName = "$policyNamePrefix-$($assignment.PrincipalName)-$($assignment.RoleName)"
         if ($config["POLICY_NAME_PREFIX"]) { $policyName = "$($config["POLICY_NAME_PREFIX"])$policyName" }
         if ($config["POLICY_NAME_SUFFIX"]) { $policyName = "$policyName$($config["POLICY_NAME_SUFFIX"])" }
         
@@ -516,33 +950,46 @@ foreach ($assignment in $pimResults) {
         $startDate = $null
         $endDate = $null
         
-        if ($assignment.EligibilityStartDate -and $assignment.EligibilityStartDate -ne "Not set") {
-            try {
-                $startDate = ([DateTime]$assignment.EligibilityStartDate).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-            } catch {
-                Write-Log "Could not parse start date: $($assignment.EligibilityStartDate)" "WARNING"
-            }
-        }
-        
+        # Only set dates if the assignment is not permanent
         if ($assignment.EligibilityEndDate -and $assignment.EligibilityEndDate -ne "Permanent") {
+            if ($assignment.EligibilityStartDate -and $assignment.EligibilityStartDate -ne "Not set") {
+                try {
+                    $startDate = ([DateTime]$assignment.EligibilityStartDate).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                } catch {
+                    Write-Log "Could not parse start date: $($assignment.EligibilityStartDate)" "WARNING"
+                }
+            }
+            
             try {
                 $endDate = ([DateTime]$assignment.EligibilityEndDate).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
             } catch {
                 Write-Log "Could not parse end date: $($assignment.EligibilityEndDate)" "WARNING"
             }
+        } else {
+            Write-Log "Assignment is permanent - setting both startDate and endDate to null" "DEBUG"
         }
         
-        # Build entityId - combine subscription path with role definition
-        $entityId = "/subscriptions/$($assignment.SubscriptionId)$($assignment.RoleDefinitionId)"
+        # Determine if this is an Entra directory role or subscription role
+        $isDirectoryRole = ($assignment.AssignmentType -eq "Entra Directory Role")
         
-        # Build entitySourceId for subscription
-        $entitySourceId = "subscriptions/$($assignment.SubscriptionId)"
+        if ($isDirectoryRole) {
+            # For Entra directory roles: entityId is the role definition ID
+            $entityId = $assignment.RoleDefinitionId
+            $workspaceType = "directory"
+            $entitySourceId = $organizationId  # Azure tenant ID (same as organization_id)
+            $roleOrganizationId = $organizationId  # Azure tenant ID
+        } else {
+            # For subscription roles: entityId includes full subscription path
+            $entityId = "/subscriptions/$($assignment.SubscriptionId)$($assignment.RoleDefinitionId)"
+            $workspaceType = "subscription"
+            $entitySourceId = "subscriptions/$($assignment.SubscriptionId)"
+            $roleOrganizationId = $organizationId  # Azure tenant ID
+        }
         
-        # Convert principal type to lowercase
-        $entityClass = $assignment.PrincipalType.ToLower()
+        Write-Log "Assignment type: $($assignment.AssignmentType), Workspace type: $workspaceType, Entity ID: $entityId, EntitySourceId: $entitySourceId" "DEBUG"
         
-        # Build entitySourceId for subscription
-        $entitySourceId = "subscriptions/$($assignment.SubscriptionId)"
+        # Convert principal type to lowercase (handle null values)
+        $entityClass = if ($assignment.PrincipalType) { $assignment.PrincipalType.ToLower() } else { "unknown" }
         
         # Build the policy JSON to match CyberArk API format
         $policyJson = @{
@@ -554,9 +1001,9 @@ foreach ($assignment in $pimResults) {
             roles = @(
                 @{
                     entityId = $entityId
-                    workspaceType = "subscription"
+                    workspaceType = $workspaceType
                     entitySourceId = $entitySourceId
-                    organization_id = $organizationId  # Azure AD/Entra ID Tenant ID
+                    organization_id = $roleOrganizationId
                 }
             )
             identities = @(
