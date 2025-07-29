@@ -9,6 +9,8 @@ This repository contains a PowerShell script for migrating Azure PIM assignments
    ```powershell
    ./escape.ps1 -ConfigFile cyberark-config.txt
    ```
+   If you omit `-ConfigFile`, the script uses `cyberark-config.txt` from the
+   same directory.
 
 The script logs operations to `logs.txt` in the working directory.
 
@@ -32,6 +34,8 @@ See `escape.ps1` for the detailed implementation.
 ```
 
 Adjust the values to match your environment.
+By default, the script searches for this file in the same directory if no
+`-ConfigFile` parameter is provided.
 
 ## Disclaimer
 
