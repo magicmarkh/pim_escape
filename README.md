@@ -16,7 +16,7 @@ The script logs operations to `logs.txt` in the working directory.
 
 The script performs four steps:
 
-1. **Export PIM data from Azure** – gathers eligible assignments for each subscription.
+1. **Export PIM data from Azure** – gathers eligible assignments for each subscription & Entra ID.
 2. **Authenticate with CyberArk SCA** – requests an OAuth2 token using credentials from the config file.
 3. **Create CyberArk SCA policies** – generates access policies for each PIM assignment.
 4. **Final summary** – prints totals and a summary of successes and errors.
