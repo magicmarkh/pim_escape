@@ -1,0 +1,53 @@
+# CyberArk SCA Migration Configuration File
+# This file contains configuration variables for the PIM to CyberArk SCA migration script
+# Leave values empty to be prompted during script execution
+
+# CyberArk Identity Tenant ID - Retrieve your tenant id from your username --> about --> Identity Id (ABC1234 format)
+# Auth base url is https://<identity_tenant_id>.id.cyberark.cloud
+IDENTITY_TENANT_ID=
+
+# CyberArk Tenant Name - The SCA base URL is https://<tenant_name>.sca.cyberark.cloud
+TENANT_NAME=
+
+# Azure AD/Entra ID Organization ID (Tenant ID) - REQUIRED
+# This is your Azure AD tenant ID where the PIM assignments exist
+# Example: 12345678-1234-1234-1234-123456789012
+# You can find this in Azure Portal > Azure Active Directory > Properties > Tenant ID
+ORGANIZATION_ID=
+
+# Directory Service Integration (default: false)
+# Set to true to use Azure AD as external directory service
+# Set to false to use local CyberArk identities (00000000-0000-0000-0000-000000000000)
+# NOTE: Only Azure AD as external directory is currently supported
+IS_DIRECTORY_SERVICE=false
+
+# The CyberArk GUID for your external directory
+# Only required if IS_DIRECTORY_SERVICE is set to true
+EXTERNAL_DIRECTORY_GUID=
+
+# Credentials (leave empty to be prompted securely)
+USERNAME=
+PASSWORD=
+
+# Default timezone for access rules
+# Options: America/New_York, America/Los_Angeles, Europe/London, etc.
+DEFAULT_TIMEZONE=America/New_York
+
+# Default session duration in hours
+DEFAULT_SESSION_DURATION_HOURS=1
+
+# Migration settings
+# Add prefix to policy names (optional)
+POLICY_NAME_PREFIX=
+
+# Add suffix to policy names (optional)  
+POLICY_NAME_SUFFIX=
+
+# Test mode - set to true to validate JSON without creating policies
+TEST_MODE=false
+
+# Batch size for processing (number of policies to create before pausing)
+BATCH_SIZE=10
+
+# Delay between batches in seconds
+BATCH_DELAY_SECONDS=2
