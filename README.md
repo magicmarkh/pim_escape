@@ -41,3 +41,11 @@ By default, the script searches for this file in the same directory if no
 
 This project is open source and not actively maintained. It is intended for proof of concept purposes only. Use at your own risk.
 
+## Tested Use Cases
+
+PIM policy migration for Entra ID
+PIM Policy migration for PIM policies at the management group level
+PIM policy migration for PIM policies at the subscription level
+PIM policy assigned to groups
+PIM policy assigned to users
+Tested using Entra ID as the external directory
