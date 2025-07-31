@@ -200,7 +200,7 @@ $identityEntitySourceId = if ($isDirectoryService) {
     }
 } else { 
     Write-Log "Using local CyberArk identities (not external directory)" "INFO"
-    "00000000-0000-0000-0000-000000000000" 
+    "0000-0000-0000-0000-0000" 
 }
 
 # Build URLs from tenant information
