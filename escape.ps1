@@ -453,16 +453,23 @@ foreach ($subscription in $subscriptions) {
                     }
                 }
                 
-                # Parse scope information
+                # Parse scope information - ENHANCED WITH MANAGEMENT GROUP SUPPORT
                 $scope = $props.scope
                 $resourceGroupName = "N/A"
                 $scopeType = "Subscription"
                 $scopeName = $subscription.Name
                 $resourceName = "N/A"
                 $resourceType = "N/A"
+                $managementGroupId = "N/A"
                 
                 if ($scope) {
-                    if ($scope -match "/subscriptions/[^/]+/resourceGroups/([^/]+)/?$") {
+                    if ($scope -match "/providers/Microsoft\.Management/managementGroups/([^/]+)") {
+                        # Management Group level assignment
+                        $managementGroupId = $Matches[1]
+                        $scopeType = "Management Group"
+                        $scopeName = $managementGroupId
+                        Write-Log "Detected management group assignment: $managementGroupId" "DEBUG"
+                    } elseif ($scope -match "/subscriptions/[^/]+/resourceGroups/([^/]+)/?$") {
                         # Resource Group level assignment
                         $resourceGroupName = $Matches[1]
                         $scopeType = "Resource Group"
@@ -494,7 +501,7 @@ foreach ($subscription in $subscriptions) {
                     }
                 }
                 
-                # Create result object
+                # Create result object - ENHANCED WITH MANAGEMENT GROUP ID
                 $result = [PSCustomObject]@{
                     AssignmentType = "Azure Subscription Role"
                     AssignmentId = $assignment.name
@@ -508,6 +515,7 @@ foreach ($subscription in $subscriptions) {
                     ScopeId = $scope
                     ScopeName = $scopeName
                     ScopeType = $scopeType
+                    ManagementGroupId = $managementGroupId
                     SubscriptionId = $subscription.Id
                     SubscriptionName = $subscription.Name
                     ResourceGroupName = $resourceGroupName
@@ -537,6 +545,127 @@ foreach ($subscription in $subscriptions) {
         
     } catch {
         Write-Log "Could not retrieve PIM assignments for subscription $($subscription.Name): $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# ========================================
+# DEDUPLICATION LOGIC FOR MANAGEMENT GROUPS
+# ========================================
+
+Write-Log "Deduplicating management group assignments..." "INFO"
+$originalCount = $pimResults.Count
+
+# Group by AssignmentId to find duplicates
+$groupedAssignments = $pimResults | Group-Object AssignmentId
+
+$deduplicatedResults = @()
+$duplicatesRemoved = 0
+
+foreach ($group in $groupedAssignments) {
+    if ($group.Count -gt 1) {
+        # Multiple entries with same AssignmentId - check if any are management group assignments
+        $mgmtGroupAssignment = $group.Group | Where-Object { $_.ScopeType -eq "Management Group" }
+        
+        if ($mgmtGroupAssignment) {
+            # Keep only the management group assignment
+            $deduplicatedResults += $mgmtGroupAssignment[0]
+            $duplicatesRemoved += ($group.Count - 1)
+            Write-Log "Deduplicated management group assignment: $($mgmtGroupAssignment[0].PrincipalName) -> $($mgmtGroupAssignment[0].RoleName) on MG $($mgmtGroupAssignment[0].ManagementGroupId)" "DEBUG"
+        } else {
+            # No management group assignment found, keep all entries
+            $deduplicatedResults += $group.Group
+        }
+    } else {
+        # Single entry, keep it
+        $deduplicatedResults += $group.Group
+    }
+}
+
+$pimResults = $deduplicatedResults
+Write-Log "Deduplication complete: Removed $duplicatesRemoved duplicate subscription entries from management group assignments" "SUCCESS"
+Write-Log "PIM results count: $originalCount -> $($pimResults.Count)" "INFO"
+
+# ========================================
+# RESOLVE MANAGEMENT GROUP NAMES
+# ========================================
+
+Write-Log "Resolving management group names for policy naming..." "INFO"
+
+# Get unique management group IDs that need resolution
+$mgmtGroupIds = $pimResults | Where-Object { $_.ScopeType -eq "Management Group" -and $_.ManagementGroupId -ne "N/A" } | Select-Object -ExpandProperty ManagementGroupId -Unique
+
+if ($mgmtGroupIds.Count -gt 0) {
+    Write-Log "Found $($mgmtGroupIds.Count) unique management groups to resolve" "INFO"
+    
+    # Create a hashtable to cache management group names
+    $mgmtGroupNames = @{}
+    
+    foreach ($mgId in $mgmtGroupIds) {
+        try {
+            Write-Log "Resolving management group: $mgId" "DEBUG"
+            
+            # Try using Azure PowerShell cmdlet first
+            try {
+                $mgInfo = Get-AzManagementGroup -GroupId $mgId -ErrorAction Stop
+                if ($mgInfo -and $mgInfo.DisplayName) {
+                    $mgmtGroupNames[$mgId] = $mgInfo.DisplayName
+                    Write-Log "Resolved management group $mgId -> $($mgInfo.DisplayName)" "DEBUG"
+                } else {
+                    Write-Log "Management group $mgId found but no DisplayName available" "WARNING"
+                    $mgmtGroupNames[$mgId] = $mgId  # Fallback to ID
+                }
+            } catch {
+                Write-Log "Azure PowerShell cmdlet failed for $mgId, trying REST API..." "DEBUG"
+                
+                # Fallback to REST API
+                try {
+                    $mgApiUrl = "https://management.azure.com/providers/Microsoft.Management/managementGroups/$mgId" + "?api-version=2020-05-01"
+                    $mgResponse = Invoke-RestMethod -Uri $mgApiUrl -Headers $azHeaders -Method Get
+                    
+                    if ($mgResponse -and $mgResponse.properties -and $mgResponse.properties.displayName) {
+                        $mgmtGroupNames[$mgId] = $mgResponse.properties.displayName
+                        Write-Log "Resolved management group via API $mgId -> $($mgResponse.properties.displayName)" "DEBUG"
+                    } else {
+                        Write-Log "Management group $mgId found via API but no displayName available" "WARNING"
+                        $mgmtGroupNames[$mgId] = $mgId  # Fallback to ID
+                    }
+                } catch {
+                    Write-Log "Could not resolve management group name for $mgId via REST API: $($_.Exception.Message)" "WARNING"
+                    $mgmtGroupNames[$mgId] = $mgId  # Fallback to ID
+                }
+            }
+            
+        } catch {
+            Write-Log "Could not resolve management group name for $mgId`: $($_.Exception.Message)" "WARNING"
+            $mgmtGroupNames[$mgId] = $mgId  # Fallback to ID
+        }
+    }
+    
+    # Update PIM results with resolved management group names
+    foreach ($result in $pimResults) {
+        if ($result.ScopeType -eq "Management Group" -and $result.ManagementGroupId -ne "N/A") {
+            if ($mgmtGroupNames.ContainsKey($result.ManagementGroupId)) {
+                # Add a new property for the resolved name
+                $result | Add-Member -NotePropertyName "ManagementGroupName" -NotePropertyValue $mgmtGroupNames[$result.ManagementGroupId] -Force
+                Write-Log "Updated result for $($result.PrincipalName) with management group name: $($mgmtGroupNames[$result.ManagementGroupId])" "DEBUG"
+            } else {
+                # Fallback to ID if resolution failed
+                $result | Add-Member -NotePropertyName "ManagementGroupName" -NotePropertyValue $result.ManagementGroupId -Force
+                Write-Log "Using management group ID as fallback for $($result.PrincipalName): $($result.ManagementGroupId)" "DEBUG"
+            }
+        } else {
+            # For non-management group assignments, set to N/A
+            $result | Add-Member -NotePropertyName "ManagementGroupName" -NotePropertyValue "N/A" -Force
+        }
+    }
+    
+    Write-Log "Management group name resolution complete" "SUCCESS"
+} else {
+    Write-Log "No management group assignments found - skipping name resolution" "INFO"
+    
+    # Add the property to all results for consistency
+    foreach ($result in $pimResults) {
+        $result | Add-Member -NotePropertyName "ManagementGroupName" -NotePropertyValue "N/A" -Force
     }
 }
 
@@ -766,6 +895,7 @@ if (!$graphToken) {
                     ScopeId = $assignment.directoryScopeId
                     ScopeName = if ($assignment.directoryScopeId -eq "/") { "Directory" } else { $assignment.directoryScopeId }
                     ScopeType = "Directory"
+                    ManagementGroupId = "N/A"
                     SubscriptionId = "N/A"
                     SubscriptionName = "N/A"
                     ResourceGroupName = "N/A"
@@ -935,33 +1065,79 @@ foreach ($assignment in $pimResults) {
         
         Write-Log "[$processedCount/$($pimResults.Count)] Processing: $($assignment.PrincipalName) -> $($assignment.RoleName) on $($assignment.ScopeName)" "INFO"
         
-        # Build policy name with optional prefix/suffix
-        # Use "Entra-" prefix for directory roles, SubscriptionName for subscription roles
-        $policyNamePrefix = if ($assignment.AssignmentType -eq "Entra Directory Role") { "Entra" } else { $assignment.SubscriptionName }
+        # Build policy name with enhanced logic for management groups
+        $policyNamePrefix = ""
+        if ($assignment.AssignmentType -eq "Entra Directory Role") {
+            $policyNamePrefix = "Entra"
+        } elseif ($assignment.ScopeType -eq "Management Group") {
+            # Use the resolved management group name instead of the GUID
+            $mgName = if ($assignment.ManagementGroupName -and $assignment.ManagementGroupName -ne "N/A") { 
+                $assignment.ManagementGroupName 
+            } else { 
+                $assignment.ManagementGroupId 
+            }
+            $policyNamePrefix = "MG-$mgName"
+        } else {
+            $policyNamePrefix = $assignment.SubscriptionName
+        }
+        
         $policyName = "$policyNamePrefix-$($assignment.PrincipalName)-$($assignment.RoleName)"
-        if ($config["POLICY_NAME_PREFIX"]) { $policyName = "$($config["POLICY_NAME_PREFIX"])$policyName" }
-        if ($config["POLICY_NAME_SUFFIX"]) { $policyName = "$policyName$($config["POLICY_NAME_SUFFIX"])" }
+        if ($config["POLICY_NAME_PREFIX"]) { 
+            $policyName = "$($config["POLICY_NAME_PREFIX"])$policyName" 
+        }
+        if ($config["POLICY_NAME_SUFFIX"]) { 
+            $policyName = "$policyName$($config["POLICY_NAME_SUFFIX"])" 
+        }
         
         # Build description with today's date
         $todayDate = Get-Date -Format "yyyy-MM-dd"
         $description = "Migrated from PIM on $todayDate"
         
-        # Convert dates to ISO format
+        # Convert dates to ISO format with past date handling
         $startDate = $null
         $endDate = $null
+        $currentDateTime = Get-Date
         
         # Only set dates if the assignment is not permanent
         if ($assignment.EligibilityEndDate -and $assignment.EligibilityEndDate -ne "Permanent") {
+            # Handle start date
             if ($assignment.EligibilityStartDate -and $assignment.EligibilityStartDate -ne "Not set") {
                 try {
-                    $startDate = ([DateTime]$assignment.EligibilityStartDate).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                    $parsedStartDate = [DateTime]$assignment.EligibilityStartDate
+                    
+                    # Check if start date is in the past
+                    if ($parsedStartDate -lt $currentDateTime) {
+                        Write-Log "Original start date $($assignment.EligibilityStartDate) is in the past. Using current date instead." "WARNING"
+                        $startDate = $currentDateTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                    } else {
+                        $startDate = $parsedStartDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                    }
                 } catch {
                     Write-Log "Could not parse start date: $($assignment.EligibilityStartDate)" "WARNING"
+                    # If we can't parse the start date, use current date as fallback
+                    Write-Log "Using current date as fallback for start date" "INFO"
+                    $startDate = $currentDateTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
                 }
             }
             
+            # Handle end date
             try {
-                $endDate = ([DateTime]$assignment.EligibilityEndDate).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                $parsedEndDate = [DateTime]$assignment.EligibilityEndDate
+                
+                # Ensure end date is after start date (if start date exists)
+                if ($startDate) {
+                    $startDateParsed = [DateTime]::Parse($startDate)
+                    if ($parsedEndDate -le $startDateParsed) {
+                        Write-Log "End date $($assignment.EligibilityEndDate) is not after start date. Adjusting end date to be 1 year from start date." "WARNING"
+                        $adjustedEndDate = $startDateParsed.AddYears(1)
+                        $endDate = $adjustedEndDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                    } else {
+                        $endDate = $parsedEndDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                    }
+                } else {
+                    $endDate = $parsedEndDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                }
+                
             } catch {
                 Write-Log "Could not parse end date: $($assignment.EligibilityEndDate)" "WARNING"
             }
@@ -969,14 +1145,21 @@ foreach ($assignment in $pimResults) {
             Write-Log "Assignment is permanent - setting both startDate and endDate to null" "DEBUG"
         }
         
-        # Determine if this is an Entra directory role or subscription role
+        # Enhanced entity configuration based on scope type
         $isDirectoryRole = ($assignment.AssignmentType -eq "Entra Directory Role")
+        $isManagementGroup = ($assignment.ScopeType -eq "Management Group")
         
         if ($isDirectoryRole) {
             # For Entra directory roles: entityId is the role definition ID
             $entityId = $assignment.RoleDefinitionId
             $workspaceType = "directory"
             $entitySourceId = $organizationId  # Azure tenant ID (same as organization_id)
+            $roleOrganizationId = $organizationId  # Azure tenant ID
+        } elseif ($isManagementGroup) {
+            # For management group assignments: entityId is just the role definition, not the full path
+            $entityId = $assignment.RoleDefinitionId
+            $workspaceType = "management_group"
+            $entitySourceId = "providers/Microsoft.Management/managementGroups/$($assignment.ManagementGroupId)"
             $roleOrganizationId = $organizationId  # Azure tenant ID
         } else {
             # For subscription roles: entityId includes full subscription path
@@ -986,7 +1169,9 @@ foreach ($assignment in $pimResults) {
             $roleOrganizationId = $organizationId  # Azure tenant ID
         }
         
-        Write-Log "Assignment type: $($assignment.AssignmentType), Workspace type: $workspaceType, Entity ID: $entityId, EntitySourceId: $entitySourceId" "DEBUG"
+        Write-Log "Assignment type: $($assignment.AssignmentType), Scope type: $($assignment.ScopeType), Workspace type: $workspaceType" "DEBUG"
+        Write-Log "Entity ID: $entityId" "DEBUG"
+        Write-Log "EntitySourceId: $entitySourceId" "DEBUG"
         
         # Convert principal type to lowercase (handle null values)
         $entityClass = if ($assignment.PrincipalType) { $assignment.PrincipalType.ToLower() } else { "unknown" }
