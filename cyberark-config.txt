@@ -6,7 +6,7 @@
 # Auth base url is https://<identity_tenant_id>.id.cyberark.cloud
 IDENTITY_TENANT_ID=
 
-# CyberArk Tenant Name - The SCA base URL is https://<tenant_name>.sca.cyberark.cloud
+# CyberArk Tenant Name - The UAP base URL is https://<tenant_name>uap.cyberark.cloud
 TENANT_NAME=
 
 # Azure AD/Entra ID Organization ID (Tenant ID) - REQUIRED
@@ -24,6 +24,12 @@ IS_DIRECTORY_SERVICE=false
 # The CyberArk GUID for your external directory
 # Only required if IS_DIRECTORY_SERVICE is set to true
 EXTERNAL_DIRECTORY_GUID=
+
+# Source directory display name as it appears in CyberArk Identity
+# (e.g. "CyberArk Cloud Directory" or "Azure AD"). Used in the principals
+# block of the new UAP policy payload. Leave empty to auto-default based
+# on IS_DIRECTORY_SERVICE.
+SOURCE_DIRECTORY_NAME=
 
 # Credentials (leave empty to be prompted securely)
 USERNAME=

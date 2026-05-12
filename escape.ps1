@@ -127,6 +127,7 @@ TENANT_NAME=
 ORGANIZATION_ID=
 IS_DIRECTORY_SERVICE=false
 EXTERNAL_DIRECTORY_GUID=
+SOURCE_DIRECTORY_NAME=
 USERNAME=
 PASSWORD=
 DEFAULT_TIMEZONE=America/New_York
@@ -180,6 +181,7 @@ $timezone = Get-ConfigValue -Key "DEFAULT_TIMEZONE" -Config $config -Prompt "Ent
 $sessionDuration = Get-ConfigValue -Key "DEFAULT_SESSION_DURATION_HOURS" -Config $config -Prompt "Max Session Duration in Hours (default: 1)"
 $isDirectoryService = ($config["IS_DIRECTORY_SERVICE"] -eq "true")
 $externalDirectoryGuid = Get-ConfigValue -Key "EXTERNAL_DIRECTORY_GUID" -Config $config -Prompt "Enter CyberArk GUID for your external directory"
+$sourceDirectoryName = if ($config["SOURCE_DIRECTORY_NAME"]) { $config["SOURCE_DIRECTORY_NAME"] } elseif ($isDirectoryService) { "Azure AD" } else { "CyberArk Cloud Directory" }
 $testMode = ($config["TEST_MODE"] -eq "true")
 $batchSize = if ($config["BATCH_SIZE"]) { [int]$config["BATCH_SIZE"] } else { 10 }
 $batchDelay = if ($config["BATCH_DELAY_SECONDS"]) { [int]$config["BATCH_DELAY_SECONDS"] } else { 2 }
@@ -205,9 +207,9 @@ $identityEntitySourceId = if ($isDirectoryService) {
 
 # Build URLs from tenant information
 $authBaseUrl = "https://$identityTenantId.id.cyberark.cloud"
-$apiBaseUrl = "https://$tenantName.sca.cyberark.cloud"
+$apiBaseUrl = "https://${tenantName}uap.cyberark.cloud"
 $platformTokenEndpoint = "/oauth2/platformtoken"
-$createPolicyEndpoint = "/api/policies/create-policy"
+$createPolicyEndpoint = "/api/policies"
 
 Write-Log "Configuration Summary:" "INFO"
 Write-Log "Identity Tenant ID: $identityTenantId" "DEBUG"
@@ -218,6 +220,7 @@ Write-Log "Azure AD/Entra Organization ID: $organizationId" "DEBUG"
 Write-Log "Directory Service Integration: $isDirectoryService" "DEBUG"
 Write-Log "Identity Entity Source ID: $identityEntitySourceId" "DEBUG"
 Write-Log "External Directory GUID: $externalDirectoryGuid" "DEBUG"
+Write-Log "Source Directory Name: $sourceDirectoryName" "DEBUG"
 Write-Log "Username: $username" "DEBUG"
 Write-Log "Timezone: $timezone" "DEBUG"
 Write-Log "Session Duration: $sessionDuration hours" "DEBUG"
@@ -1093,126 +1096,155 @@ foreach ($assignment in $pimResults) {
         $todayDate = Get-Date -Format "yyyy-MM-dd"
         $description = "Migrated from PIM on $todayDate"
         
-        # Convert dates to ISO format with past date handling
+        # Convert dates to ISO format (no Z suffix, UAP API expects yyyy-MM-ddTHH:mm:ss)
         $startDate = $null
         $endDate = $null
         $currentDateTime = Get-Date
-        
+        $uapDateFormat = "yyyy-MM-ddTHH:mm:ss"
+
         # Only set dates if the assignment is not permanent
         if ($assignment.EligibilityEndDate -and $assignment.EligibilityEndDate -ne "Permanent") {
             # Handle start date
             if ($assignment.EligibilityStartDate -and $assignment.EligibilityStartDate -ne "Not set") {
                 try {
                     $parsedStartDate = [DateTime]$assignment.EligibilityStartDate
-                    
+
                     # Check if start date is in the past
                     if ($parsedStartDate -lt $currentDateTime) {
                         Write-Log "Original start date $($assignment.EligibilityStartDate) is in the past. Using current date instead." "WARNING"
-                        $startDate = $currentDateTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                        $startDate = $currentDateTime.ToUniversalTime().ToString($uapDateFormat)
                     } else {
-                        $startDate = $parsedStartDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                        $startDate = $parsedStartDate.ToUniversalTime().ToString($uapDateFormat)
                     }
                 } catch {
                     Write-Log "Could not parse start date: $($assignment.EligibilityStartDate)" "WARNING"
                     # If we can't parse the start date, use current date as fallback
                     Write-Log "Using current date as fallback for start date" "INFO"
-                    $startDate = $currentDateTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                    $startDate = $currentDateTime.ToUniversalTime().ToString($uapDateFormat)
                 }
             }
-            
+
             # Handle end date
             try {
                 $parsedEndDate = [DateTime]$assignment.EligibilityEndDate
-                
+
                 # Ensure end date is after start date (if start date exists)
                 if ($startDate) {
                     $startDateParsed = [DateTime]::Parse($startDate)
                     if ($parsedEndDate -le $startDateParsed) {
                         Write-Log "End date $($assignment.EligibilityEndDate) is not after start date. Adjusting end date to be 1 year from start date." "WARNING"
                         $adjustedEndDate = $startDateParsed.AddYears(1)
-                        $endDate = $adjustedEndDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                        $endDate = $adjustedEndDate.ToUniversalTime().ToString($uapDateFormat)
                     } else {
-                        $endDate = $parsedEndDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                        $endDate = $parsedEndDate.ToUniversalTime().ToString($uapDateFormat)
                     }
                 } else {
-                    $endDate = $parsedEndDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                    $endDate = $parsedEndDate.ToUniversalTime().ToString($uapDateFormat)
                 }
-                
+
             } catch {
                 Write-Log "Could not parse end date: $($assignment.EligibilityEndDate)" "WARNING"
             }
         } else {
-            Write-Log "Assignment is permanent - setting both startDate and endDate to null" "DEBUG"
+            Write-Log "Assignment is permanent - timeFrame will be set to 0/0" "DEBUG"
         }
         
-        # Enhanced entity configuration based on scope type
+        # Determine target shape based on scope type. The new UAP API uses
+        # roleId / workspaceId / orgId / workspaceType rather than the old
+        # entityId / entitySourceId / organization_id fields.
         $isDirectoryRole = ($assignment.AssignmentType -eq "Entra Directory Role")
         $isManagementGroup = ($assignment.ScopeType -eq "Management Group")
-        
+
         if ($isDirectoryRole) {
-            # For Entra directory roles: entityId is the role definition ID
-            $entityId = $assignment.RoleDefinitionId
+            # Entra directory role: roleId is the bare role definition GUID,
+            # workspaceId and orgId are both the Azure tenant ID.
+            $targetRoleId = $assignment.RoleDefinitionId
             $workspaceType = "directory"
-            $entitySourceId = $organizationId  # Azure tenant ID (same as organization_id)
-            $roleOrganizationId = $organizationId  # Azure tenant ID
+            $targetWorkspaceId = $organizationId
+            $targetOrgId = $organizationId
         } elseif ($isManagementGroup) {
-            # For management group assignments: entityId is just the role definition, not the full path
-            $entityId = $assignment.RoleDefinitionId
+            # Management group: roleId is the role-definition path,
+            # workspaceId is the MG path, orgId is the MG ID.
+            $targetRoleId = $assignment.RoleDefinitionId
             $workspaceType = "management_group"
-            $entitySourceId = "providers/Microsoft.Management/managementGroups/$($assignment.ManagementGroupId)"
-            $roleOrganizationId = $organizationId  # Azure tenant ID
+            $targetWorkspaceId = "providers/Microsoft.Management/managementGroups/$($assignment.ManagementGroupId)"
+            $targetOrgId = $assignment.ManagementGroupId
         } else {
-            # For subscription roles: entityId includes full subscription path
-            $entityId = "/subscriptions/$($assignment.SubscriptionId)$($assignment.RoleDefinitionId)"
+            # Subscription: roleId includes the full subscription-scoped path,
+            # workspaceId is the subscription path, orgId is the Azure tenant.
+            $targetRoleId = "/subscriptions/$($assignment.SubscriptionId)$($assignment.RoleDefinitionId)"
             $workspaceType = "subscription"
-            $entitySourceId = "subscriptions/$($assignment.SubscriptionId)"
-            $roleOrganizationId = $organizationId  # Azure tenant ID
+            $targetWorkspaceId = "subscriptions/$($assignment.SubscriptionId)"
+            $targetOrgId = $organizationId
         }
-        
+
         Write-Log "Assignment type: $($assignment.AssignmentType), Scope type: $($assignment.ScopeType), Workspace type: $workspaceType" "DEBUG"
-        Write-Log "Entity ID: $entityId" "DEBUG"
-        Write-Log "EntitySourceId: $entitySourceId" "DEBUG"
-        
-        # Convert principal type to lowercase (handle null values)
-        $entityClass = if ($assignment.PrincipalType) { $assignment.PrincipalType.ToLower() } else { "unknown" }
-        
-        # Build the policy JSON to match CyberArk API format
+        Write-Log "Target roleId: $targetRoleId" "DEBUG"
+        Write-Log "Target workspaceId: $targetWorkspaceId" "DEBUG"
+        Write-Log "Target orgId: $targetOrgId" "DEBUG"
+
+        # Principal type for the new API is uppercase USER/GROUP.
+        $principalType = if ($assignment.PrincipalType) {
+            switch ($assignment.PrincipalType.ToLower()) {
+                "user"  { "USER" }
+                "group" { "GROUP" }
+                default { $assignment.PrincipalType.ToUpper() }
+            }
+        } else { "USER" }
+
+        $principalName = if ($assignment.PrincipalUPN -and $assignment.PrincipalUPN -ne "N/A") {
+            $assignment.PrincipalUPN
+        } else {
+            $assignment.PrincipalName
+        }
+
+        # timeFrame uses ISO strings when bounded, or 0/0 for permanent assignments.
+        $timeFrameBlock = if ($startDate -and $endDate) {
+            @{ fromTime = $startDate; toTime = $endDate }
+        } else {
+            @{ fromTime = 0; toTime = 0 }
+        }
+
+        # Build the policy JSON for the new UAP /api/policies endpoint.
         $policyJson = @{
-            csp = "AZURE"
-            name = $policyName
-            description = $description
-            startDate = $startDate
-            endDate = $endDate
-            roles = @(
-                @{
-                    entityId = $entityId
-                    workspaceType = $workspaceType
-                    entitySourceId = $entitySourceId
-                    organization_id = $roleOrganizationId
+            metadata = @{
+                name = $policyName
+                description = $description
+                timeFrame = $timeFrameBlock
+                policyEntitlement = @{
+                    targetCategory = "Cloud console"
+                    locationType = "Azure"
+                    policyType = "Recurring"
                 }
-            )
-            identities = @(
-                @{
-                    entityName = if ($assignment.PrincipalUPN -and $assignment.PrincipalUPN -ne "N/A") { $assignment.PrincipalUPN } else { $assignment.PrincipalName }
-                    entitySourceId = $identityEntitySourceId
-                    entityClass = $entityClass
-                }
-            )
-            accessRules = @{
-                days = @(
-                    "Sunday",
-                    "Monday", 
-                    "Tuesday",
-                    "Wednesday",
-                    "Thursday",
-                    "Friday",
-                    "Saturday"
-                )
-                fromTime = $null
-                toTime = $null
-                maxSessionDuration = [int]$sessionDuration
+                policyTags = @("PIM-Migration")
                 timeZone = $timezone
             }
+            conditions = @{
+                accessWindow = @{
+                    daysOfTheWeek = @(0, 1, 2, 3, 4, 5, 6)
+                }
+                maxSessionDuration = [int]$sessionDuration
+            }
+            targets = @{
+                targets = @(
+                    @{
+                        roleId = $targetRoleId
+                        workspaceId = $targetWorkspaceId
+                        orgId = $targetOrgId
+                        workspaceType = $workspaceType
+                    }
+                )
+            }
+            principals = @(
+                @{
+                    id = $assignment.PrincipalId
+                    name = $principalName
+                    sourceDirectoryName = $sourceDirectoryName
+                    sourceDirectoryId = $identityEntitySourceId
+                    type = $principalType
+                }
+            )
+            delegationClassification = "Unrestricted"
         }
         
         # Convert to JSON
@@ -1223,8 +1255,8 @@ foreach ($assignment in $pimResults) {
         
         if ($testMode) {
             Write-Log "Test Mode: Policy JSON generated successfully for $($policyName)" "SUCCESS"
-            Write-Log "Entity ID: $entityId" "DEBUG"
-            Write-Log "Identity: $($assignment.PrincipalName) ($entityClass)" "DEBUG"
+            Write-Log "Role ID: $targetRoleId" "DEBUG"
+            Write-Log "Principal: $principalName ($principalType)" "DEBUG"
             $successCount++
         } else {
             # Create the policy via API
@@ -1234,16 +1266,20 @@ foreach ($assignment in $pimResults) {
             
             try {
                 $policyResponse = Invoke-RestMethod -Uri $createPolicyUrl -Method Post -Body $policyBody -Headers $apiHeaders
-                
-                # The expected response field is job_id
-                $jobId = if ($policyResponse.job_id) {
+
+                # UAP API responses may use policyId, id, or job_id depending on tenant config.
+                $jobId = if ($policyResponse.policyId) {
+                    $policyResponse.policyId
+                } elseif ($policyResponse.id) {
+                    $policyResponse.id
+                } elseif ($policyResponse.job_id) {
                     $policyResponse.job_id
                 } else {
-                    "UNKNOWN_JOB_ID_FORMAT"
-                    Write-Log "API response does not contain expected job_id field. Available fields: $($policyResponse.PSObject.Properties.Name -join ', ')" "WARNING"
+                    Write-Log "API response did not contain policyId/id/job_id. Available fields: $($policyResponse.PSObject.Properties.Name -join ', ')" "WARNING"
+                    "UNKNOWN_POLICY_ID"
                 }
-                
-                Write-Log "Policy created successfully - Job ID: $jobId" "SUCCESS"
+
+                Write-Log "Policy created successfully - Policy/Job ID: $jobId" "SUCCESS"
                 $successCount++
             } catch {
                 Write-Log "Failed to create policy $($policyName): $($_.Exception.Message)" "ERROR"
@@ -1278,7 +1314,8 @@ foreach ($assignment in $pimResults) {
             CyberArkJobId = if ($testMode) { "TEST_MODE" } else { $jobId }
             StartDate = $startDate
             EndDate = $endDate
-            EntityId = $entityId
+            RoleId = $targetRoleId
+            WorkspaceId = $targetWorkspaceId
             Status = "Success"
             Error = $null
         }
@@ -1304,7 +1341,8 @@ foreach ($assignment in $pimResults) {
             CyberArkPolicyId = $null
             StartDate = $startDate
             EndDate = $endDate
-            EntityId = $entityId
+            RoleId = $targetRoleId
+            WorkspaceId = $targetWorkspaceId
             Status = "Failed"
             Error = $_.Exception.Message
         }
